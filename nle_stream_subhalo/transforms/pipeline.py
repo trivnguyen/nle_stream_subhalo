@@ -1,5 +1,6 @@
 """Compose the per-star NLE observation pipeline and measure field stats."""
 
+from tqdm import tqdm
 import torch
 
 from .basic import StarBatch
@@ -78,7 +79,7 @@ def compute_field_norm(
 
     n = batch.x.shape[0]
     x_parts, xerr_parts = [], []
-    for start in range(0, n, batch_size):
+    for start in tqdm(range(0, n, batch_size), desc='Computing field normalization'):
         stop = start + batch_size
         chunk = StarBatch(x=batch.x[start:stop])
         out = pipeline(chunk)

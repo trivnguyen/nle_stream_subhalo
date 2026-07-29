@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import zuko
 
+from .flow_matching import FlowMatching
 from .transforms import StarBatch
 from .utils import MLP, configure_optimizers, get_activation
 
@@ -22,21 +23,36 @@ def build_flow(
     features: int,
     context: int,
     flow_type: str = 'spline',
-    num_transforms: int = 3,
     hidden_features=(64, 64),
-    num_bins: int = 8,
     activation: str = None,
+    **kwargs,
 ):
-    """Build a conditional zuko flow for p(target | context)."""
-    kwargs = dict(transforms=num_transforms, hidden_features=hidden_features)
+    """Build a conditional flow for p(target | context).
+
+    `flow_type` is 'spline' or 'maf' (discrete, trained by maximum
+    likelihood) or 'flow_matching' (continuous, trained on the velocity
+    field -- see `flow_matching.FlowMatching`). `kwargs` are the remaining
+    architecture arguments of the chosen type: `num_transforms` and, for
+    splines, `num_bins`; `steps`, `chunk` and `freqs` for flow matching.
+    An argument the type does not take raises, rather than silently doing
+    nothing.
+    """
+    kwargs['hidden_features'] = hidden_features
     if activation is not None:
         kwargs['activation'] = get_activation(activation, return_instance=False)
 
+    if flow_type == 'flow_matching':
+        return FlowMatching(features, context, **kwargs)
+
+    kwargs['transforms'] = kwargs.pop('num_transforms', 3)
     if flow_type == 'spline':
-        return zuko.flows.NSF(features, context, bins=num_bins, **kwargs)
+        return zuko.flows.NSF(
+            features, context, bins=kwargs.pop('num_bins', 8), **kwargs)
     if flow_type == 'maf':
         return zuko.flows.MAF(features, context, **kwargs)
-    raise ValueError(f"Unknown flow_type: {flow_type!r} (use 'spline'/'maf')")
+    raise ValueError(
+        f"Unknown flow_type: {flow_type!r} "
+        f"(use 'spline'/'maf'/'flow_matching')")
 
 
 class NLE(pl.LightningModule):
@@ -57,6 +73,11 @@ class NLE(pl.LightningModule):
     pre_transforms : callable, optional
         Observation pipeline (measurement uncertainty) applied to raw
         batches during training only.
+    val_nll_batches : int
+        Flow matching only: validation batches on which the true NLL is
+        also measured. `val/loss` is then the velocity-regression loss,
+        which is not comparable across architectures, so `val/nll` is
+        logged alongside it for that. Each such batch costs an ODE solve.
     """
 
     def __init__(
@@ -67,6 +88,7 @@ class NLE(pl.LightningModule):
         optimizer_args: dict = None,
         scheduler_args: dict = None,
         pre_transforms=None,
+        val_nll_batches: int = 8,
     ):
         super().__init__()
         self.norm_dict = norm_dict
@@ -75,6 +97,7 @@ class NLE(pl.LightningModule):
         self.optimizer_args = optimizer_args or {}
         self.scheduler_args = scheduler_args or {}
         self.pre_transforms = pre_transforms
+        self.val_nll_batches = val_nll_batches
 
         self.save_hyperparameters(ignore=['pre_transforms'])
 
@@ -125,6 +148,7 @@ class NLE(pl.LightningModule):
             flow_context_size = context_size
 
         self.flow = build_flow(target_size, flow_context_size, **self.flows_args)
+        self.is_continuous = isinstance(self.flow, FlowMatching)
         print(f"[NLE] Modeling p({','.join(self.target_fields)} | "
               f"{','.join(self.context_fields)})")
         print(f"[NLE] Flow built with"
@@ -156,11 +180,18 @@ class NLE(pl.LightningModule):
             cols.append(value)
         return torch.cat(cols, dim=1)
 
-    def _flow_log_prob(self, norm_batch: StarBatch) -> torch.Tensor:
-        """Per-star log p(target | context) for a normalized StarBatch."""
+    def _target_context(self, norm_batch: StarBatch):
+        """Split a normalized batch into (target, embedded context)."""
         target = self._assemble(norm_batch, self.target_fields)
         context = self.context_embedding(
             self._assemble(norm_batch, self.context_fields))
+        return target, context
+
+    def _flow_log_prob(self, norm_batch: StarBatch) -> torch.Tensor:
+        """Per-star log p(target | context) for a normalized StarBatch."""
+        target, context = self._target_context(norm_batch)
+        if self.is_continuous:
+            return self.flow.log_prob(target, context)
         return self.flow(context).log_prob(target)
 
     # -- training -----------------------------------------------------------
@@ -171,17 +202,38 @@ class NLE(pl.LightningModule):
             batch = self.pre_transforms(batch)
         return self._normalize(batch)
 
+    def _loss(self, norm_batch: StarBatch) -> torch.Tensor:
+        """Training objective: velocity regression, or the NLL."""
+        if self.is_continuous:
+            return self.flow.loss(*self._target_context(norm_batch))
+        return -self._flow_log_prob(norm_batch).mean()
+
     def training_step(self, batch, batch_idx):
-        loss = -self._flow_log_prob(self._prepare_batch(batch)).mean()
+        loss = self._loss(self._prepare_batch(batch))
         self.log(
             'train/loss', loss, on_step=True, on_epoch=True, prog_bar=True,
             logger=True, batch_size=batch.x.shape[0], sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = -self._flow_log_prob(self._prepare_batch(batch)).mean()
+        norm_batch = self._prepare_batch(batch)
+        loss = self._loss(norm_batch)
         self.log(
             'val/loss', loss, on_step=False, on_epoch=True, prog_bar=True,
+            logger=True, batch_size=batch.x.shape[0], sync_dist=True)
+
+        # `val/loss` is the objective the run is early-stopped and
+        # checkpointed on; `val/nll` is the same number for the discrete
+        # flows but a separate ODE solve for flow matching, and is what
+        # makes the two families comparable.
+        if not self.is_continuous:
+            nll = loss
+        elif batch_idx < self.val_nll_batches:
+            nll = -self._flow_log_prob(norm_batch).mean()
+        else:
+            return loss
+        self.log(
+            'val/nll', nll, on_step=False, on_epoch=True, prog_bar=False,
             logger=True, batch_size=batch.x.shape[0], sync_dist=True)
         return loss
 
@@ -219,10 +271,12 @@ class NLE(pl.LightningModule):
         norm_batch = self._normalize(batch.to(self.device))
         context = self.context_embedding(
             self._assemble(norm_batch, self.context_fields))
-        samples = self.flow(context).sample((num_samples,))
+        if self.is_continuous:
+            samples = self.flow.sample(context, num_samples)
+        else:
+            samples = self.flow(context).sample((num_samples,)).transpose(0, 1)
 
         loc = torch.cat([getattr(self, f'{f}_loc') for f in self.target_fields])
         scale = torch.cat(
             [getattr(self, f'{f}_scale') for f in self.target_fields])
-        samples = samples * scale + loc
-        return samples.transpose(0, 1)
+        return samples * scale + loc

@@ -1,12 +1,22 @@
 """Training script for Neural Likelihood Estimation (NLE)."""
 
+import getpass
 import json
 import os
 import shutil
 import sys
 from pathlib import Path
 
-os.environ.setdefault('WANDB_DATA_DIR', '/scratch/tvnguyen/wandb_data')
+# $HOME is read-only on this cluster's compute nodes, so every wandb
+# directory that otherwise defaults under it (artifact staging, artifact
+# cache, downloaded artifacts) is redirected to $SCRATCH before wandb is
+# imported. Set these in the environment to override.
+_SCRATCH = os.environ.get('SCRATCH', f'/scratch/{getpass.getuser()}')
+os.environ.setdefault('WANDB_DATA_DIR', f'{_SCRATCH}/wandb_data')
+os.environ.setdefault('WANDB_CACHE_DIR', f'{_SCRATCH}/cache/wandb')
+os.environ.setdefault('WANDB_ARTIFACT_DIR', f'{_SCRATCH}/wandb_artifacts')
+os.environ.setdefault('MPLCONFIGDIR', f'{_SCRATCH}/cache/matplotlib')
+os.environ.setdefault('XDG_CACHE_HOME', f'{_SCRATCH}/cache')
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -92,6 +102,7 @@ def create_model(config: ml_collections.ConfigDict, pre_transforms, norm_dict) -
         optimizer_args=config.optimizer.to_dict(),
         scheduler_args=config.scheduler.to_dict(),
         pre_transforms=pre_transforms,
+        val_nll_batches=config.model.get('val_nll_batches', 8),
     )
 
 
@@ -153,6 +164,7 @@ def main(config: ml_collections.ConfigDict, config_path: str = None):
         reset_optimizer=config.get('reset_optimizer', False),
     )
 
+    training.report_offline_sync(wandb_logger)
     wandb.finish()
     print("[WandB] Finished")
 

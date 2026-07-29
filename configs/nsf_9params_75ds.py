@@ -1,8 +1,28 @@
-"""Per-star NLE config for the 9-param AAU perturber dataset.
+"""Per-star NLE config for the 9-param AAU dataset — full 75-file run.
 
-Trains p(star observables | perturber theta, xerr) on the same HDF5
-datasets as the NPE pipeline's `configs/chebconv_9params.py`, one training
-example per stream particle instead of one per stream.
+Successor to `nsf_9params.py`, which trained on 20 files with a 144k-param
+flow. Inference on that model (see `nle_inference.ipynb`) gave posteriors
+that were tight but biased by several sigma, and emcee/pocomc disagreed at
+the same level -- the signature of a likelihood surface that is smooth
+enough to sample but not accurate enough to sum over 200 stars. This config
+attacks that with 3.75x the data and ~10x the flow capacity.
+
+Changes vs `nsf_9params.py`:
+  * num_datasets 20 -> 75 (data.0..74; data.75..77 stay held out)
+  * hidden_features [64, 64] -> [256, 256], transforms 10 -> 12, bins 8 -> 12
+  * train_batch_size 1024 -> 8192, lr held at 5e-4
+  * train_frac 0.9 -> 0.95, num_epochs 40 -> 80
+
+The batch-size jump is the cheap one: at 1024 the step is dominated by
+kernel-launch overhead (34k stars/s), and 8192 costs the same per step
+(~250k stars/s), so the bigger flow is close to free.
+
+lr stays at the 5e-4 that trained the 20-file run: batch-size scaling rules
+would allow more (4e-3 linear, 1.4e-3 sqrt), but spline coupling parameters
+-- bin widths, heights, derivatives -- are the brittle part of an NSF and
+scaling rules say nothing about them. The 8x larger batch therefore buys
+stability rather than speed, and num_epochs is raised to 80 to make up the
+optimizer steps it costs.
 """
 
 import numpy as np
@@ -19,7 +39,8 @@ def get_config():
     ### DATA CONFIGURATION ###
     config.data_root = '/scratch/tvnguyen/stream_datasets'
     config.data_name = '9p_AAU'
-    config.num_datasets = 20
+    # 75 of the 78 files: 750k streams, 150M stars (~35 GB resident).
+    config.num_datasets = 75
     config.init = 0
     config.x_labels = ('phi1', 'phi2', 'vr', 'pm1', 'pm2', 'dist')
     config.labels = (
@@ -30,7 +51,8 @@ def get_config():
     # Measured conditioning variables (cond), fixed or MC-sampled at
     # inference. None: theta and xerr are the only context.
     config.cond_labels = None
-    config.train_frac = 0.9
+    # 5% of 750k streams is still 37.5k streams of validation.
+    config.train_frac = 0.95
     config.num_workers = 0
 
     ### LOGGING AND WANDB CONFIGURATION ###
@@ -39,8 +61,8 @@ def get_config():
     config.wandb_project = '9p_AAU_nle'
     config.entity = 'desc_sbi_stream'
     config.name = None
-    config.id = '2ms9xh94'
-    config.tags = ['nle', 'nsf']
+    config.id = 'fux1gqy9'
+    config.tags = ['nle', 'nsf', '75ds']
     config.debug = False
     config.checkpoint = 'last.ckpt'  # Path to an NLE checkpoint to resume from
     config.reset_optimizer = False
@@ -52,9 +74,9 @@ def get_config():
     # Conditional normalizing flow p(x | theta, cond, xerr).
     model.flows = ConfigDict()
     model.flows.flow_type = 'spline'
-    model.flows.num_transforms = 10
-    model.flows.hidden_features = [64, 64]
-    model.flows.num_bins = 8
+    model.flows.num_transforms = 12
+    model.flows.hidden_features = [256, 256]
+    model.flows.num_bins = 12
     model.flows.activation = 'tanh'
 
     # Optional single MLP over the combined context before the flow.
@@ -68,7 +90,8 @@ def get_config():
     ### OBSERVATION PIPELINE (pre_transforms) ###
     # One entry per feature with a measurement uncertainty; each adds a
     # column to `xerr` (in this order), which the flow conditions on.
-    # Matches the NPE config's uncertainty model.
+    # Unchanged from nsf_9params.py: the inference notebooks and the NPE
+    # configs assume this exact uncertainty model.
     config.pre_transforms = pre_transforms = ConfigDict()
     pre_transforms.apply_uncertainty = True
     pre_transforms.uncertainty_args = [
@@ -85,23 +108,31 @@ def get_config():
     ### OPTIMIZER AND SCHEDULER CONFIGURATION ###
     config.optimizer = optimizer = ConfigDict()
     optimizer.name = 'AdamW'
+    # Unchanged from the 20-file run; see the module docstring for why the
+    # larger batch does not come with a larger lr.
     optimizer.lr = 5e-4
     optimizer.weight_decay = 1e-4
 
     config.scheduler = scheduler = ConfigDict()
     scheduler.name = 'WarmUpCosineAnnealingLR'
-    scheduler.decay_steps = 40
-    scheduler.warmup_steps = 2
-    scheduler.eta_min = 2e-3
+    # Stepped per epoch, so these are epochs; decay_steps == num_epochs so
+    # the cosine finishes exactly at the end of training. eta_min is a
+    # multiplier on the base lr, not an absolute floor (see utils.py):
+    # 1e-3 -> a final lr of 1e-6.
+    scheduler.decay_steps = 80
+    scheduler.warmup_steps = 3
+    scheduler.eta_min = 1e-3
     scheduler.interval = 'epoch'
     scheduler.restart = False
     scheduler.T_mult = 1
 
     ### TRAINING CONFIGURATION ###
     config.accelerator = 'gpu'
-    config.train_batch_size = 1024
-    config.eval_batch_size = 1024
-    config.num_epochs = 40
+    # 17.4k steps/epoch, ~10 min/epoch on one H100 -> ~15 h for 80 epochs,
+    # inside the compute partition's 24 h limit with margin.
+    config.train_batch_size = 8192
+    config.eval_batch_size = 16384
+    config.num_epochs = 80
     config.num_steps = -1
     config.patience = 20
     config.gradient_clip_val = 1.0

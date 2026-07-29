@@ -25,7 +25,9 @@ def _wandb_server_reachable(timeout: float = 3.0) -> bool:
 
     Lets us pick 'online' vs 'offline' up front, so training doesn't stall
     behind wandb's own connection retries on machines without internet
-    (e.g. HPC compute nodes).
+    (e.g. HPC compute nodes). The timeout bounds the TCP connect, not the
+    DNS lookup ahead of it -- `resolve_wandb_mode` avoids calling this at
+    all under SLURM for that reason.
     """
     try:
         socket.create_connection(("api.wandb.ai", 443), timeout=timeout).close()
@@ -34,22 +36,50 @@ def _wandb_server_reachable(timeout: float = 3.0) -> bool:
         return False
 
 
+def resolve_wandb_mode(config: ml_collections.ConfigDict) -> str:
+    """Pick the wandb mode for this run.
+
+    In precedence order: `config.debug` disables logging entirely; an
+    explicit `config.wandb_mode` wins next; then a `WANDB_MODE` set in the
+    environment; then SLURM, where compute nodes have no outbound network,
+    so 'offline' is assumed without probing; otherwise the API is probed
+    and the run goes 'online' only if it answers.
+
+    Offline runs are complete on disk and are uploaded afterwards from a
+    login node with `wandb sync` (see `report_offline_sync`).
+    """
+    if config.get('debug', False):
+        return 'disabled'
+
+    mode = config.get('wandb_mode', None)
+    if mode is not None:
+        return mode
+
+    mode = os.environ.get('WANDB_MODE')
+    if mode:
+        print(f"[WandB] Using WANDB_MODE={mode} from the environment")
+        return mode
+
+    if os.environ.get('SLURM_JOB_ID'):
+        print("[WandB] SLURM job detected; assuming no outbound network")
+        return 'offline'
+
+    return 'online' if _wandb_server_reachable() else 'offline'
+
+
 def create_wandb_logger(config: ml_collections.ConfigDict, tag: str):
     """Create a WandbLogger for the run, tagged with `tag`.
 
     Returns the logger and the project directory (where checkpoints and the
-    config snapshot are saved). If `config.wandb_mode` is unset, the mode is
-    'online' when the WandB API is reachable, else 'offline'.
+    config snapshot are saved). The mode comes from `resolve_wandb_mode`.
+    `config.log_model` controls checkpoint artifacts ('all' by default);
+    offline they are staged under $WANDB_DATA_DIR and uploaded by the later
+    `wandb sync`, which costs one extra on-disk copy per checkpoint.
     """
     workdir = Path(config.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    if config.get('debug', False):
-        wandb_mode = 'disabled'
-    else:
-        wandb_mode = config.get('wandb_mode', None)
-        if wandb_mode is None:
-            wandb_mode = 'online' if _wandb_server_reachable() else 'offline'
+    wandb_mode = resolve_wandb_mode(config)
     print(f"[WandB] Mode: {wandb_mode}")
 
     tags = set(config.get('tags', [])) | {tag}
@@ -59,7 +89,7 @@ def create_wandb_logger(config: ml_collections.ConfigDict, tag: str):
         entity=config.get("entity", None),
         id=config.get("id", None),
         save_dir=str(workdir),
-        log_model="all",
+        log_model=config.get("log_model", "all"),
         config=config.to_dict(),
         mode=wandb_mode,
         resume="allow",
@@ -70,6 +100,24 @@ def create_wandb_logger(config: ml_collections.ConfigDict, tag: str):
 
     print(logger, project_dir)
     return logger, project_dir
+
+
+def report_offline_sync(logger: WandbLogger) -> None:
+    """Print the `wandb sync` command for an offline run, if it is one.
+
+    Call before `wandb.finish()` while the run directory is still known.
+    Nothing is printed for online/disabled runs.
+    """
+    run = getattr(logger, 'experiment', None)
+    run_dir = getattr(run, 'dir', None)
+    # `debug` runs get a NoopRun, which reports offline=False.
+    if run_dir is None or not getattr(run, 'offline', False):
+        return
+
+    # run.dir is the run's `files/` subdir; `wandb sync` wants its parent.
+    sync_dir = Path(run_dir).parent
+    print(f"[WandB] Offline run saved to: {sync_dir}")
+    print(f"[WandB] Upload it from a login node with: wandb sync {sync_dir}")
 
 
 def get_checkpoint_path(
