@@ -31,7 +31,8 @@ from ml_collections import config_flags
 
 from nle_stream_subhalo import datasets, training
 from nle_stream_subhalo.nle import NLE
-from nle_stream_subhalo.transforms import build_transformation
+from nle_stream_subhalo.transforms import (
+    StreamTrack, build_transformation, load_track_dict)
 
 
 def save_config_snapshot(
@@ -47,11 +48,50 @@ def save_config_snapshot(
         json.dump(config.to_dict(), f, indent=2, default=str)
     print(f"[Setup] Wrote config snapshot -> {snapshot_path}")
 
+    # A parameterized config arrives as `path.py:variant`; only the path
+    # part is a file. The variant is already captured in the JSON above.
+    if config_path:
+        config_path = config_path.split(':')[0]
     if config_path and os.path.exists(config_path):
         shutil.copy2(config_path, snapshot_dir / 'config_snapshot.py')
 
 
-def prepare_data(config: ml_collections.ConfigDict, norm_dict=None):
+def load_track(config: ml_collections.ConfigDict, snapshot_dir: Path = None):
+    """Load the unperturbed stream track, if this run uses one.
+
+    Fitted separately by `stream_sims.track` in the sbi_stream_pipeline
+    repo -- it needs the simulator, and it depends on nothing that varies
+    between training examples. A copy is dropped next to the checkpoints
+    so a run stays reproducible from its own directory.
+
+    Returns:
+        (track_dict, track) or (None, None) when `config.track_path` is
+        unset. `track_dict` goes to the model; `track` is the built
+        module, needed to measure the normalization on projected stars.
+    """
+    path = config.get('track_path', None)
+    if path is None:
+        print('[Track] No track_path: training on raw coordinates')
+        return None, None
+
+    track_dict = load_track_dict(path)
+    track = StreamTrack(track_dict, config.x_labels)
+    print(f'[Track] Loaded {path}')
+    print(f'[Track] {len(track.coords)} coordinates '
+          f"({', '.join(track.coords)}), {track.knots.numel()} knots, "
+          f'phi1 in [{track.knots[0]:.1f}, {track.knots[-1]:.1f}]')
+    print(f"[Track] source stream sha256: "
+          f"{track.meta.get('stream_sha256', 'unknown')}")
+
+    if snapshot_dir is not None:
+        shutil.copy2(path, snapshot_dir / 'track_snapshot.npz')
+
+    return track_dict, track
+
+
+def prepare_data(
+    config: ml_collections.ConfigDict, norm_dict=None, track=None,
+    track_dict=None):
     """Load data and build per-star train/val dataloaders.
 
     Each star is one row of `config.x_labels` (stream-frame observables);
@@ -60,6 +100,13 @@ def prepare_data(config: ml_collections.ConfigDict, norm_dict=None):
     Returns (train_loader, val_loader, norm_dict). When `norm_dict` is given
     (e.g. reused from a resumed checkpoint) it is passed through unchanged
     instead of recomputing field stats from this call's training data.
+    `track` is only used when the stats are recomputed, so that they
+    describe the offsets the model actually normalizes. With
+    `config.model.x_stages` set, the whole `x` transform is fitted as a
+    stage chain instead and `track_dict` becomes the track stage's state.
+    `config.norm_max_stars` caps how many training stars that measurement
+    reads; unset means all of them, which is only affordable on the
+    smaller subsets.
     """
     node_feats, graph_feats = datasets.read_datasets(
         config.data_root,
@@ -83,12 +130,33 @@ def prepare_data(config: ml_collections.ConfigDict, norm_dict=None):
         seed=config.seed_data,
         norm_dict=norm_dict,
         pre_transform_kwargs=config.pre_transforms.to_dict(),
+        track=track,
+        norm_kwargs=_norm_kwargs(config, track_dict),
+        norm_max_stars=config.get('norm_max_stars', None),
     )
 
     return train_loader, val_loader, norm_dict
 
 
-def create_model(config: ml_collections.ConfigDict, pre_transforms, norm_dict) -> NLE:
+def _norm_kwargs(config: ml_collections.ConfigDict, track_dict=None) -> dict:
+    """Stage-chain arguments for `compute_field_norm`, if this run uses one.
+
+    Empty dict means the legacy single affine `x` scaling.
+    """
+    stages = config.model.get('x_stages', None)
+    if stages is None:
+        return {}
+    stages = list(stages)
+    print(f"[Stages] Fitting x chain: {' -> '.join(stages)}")
+    return dict(x_stages=stages, track_dict=track_dict,
+                x_labels=list(config.x_labels),
+                n_knots=config.model.get('n_knots', 256))
+
+
+def create_model(
+    config: ml_collections.ConfigDict, pre_transforms, norm_dict,
+    track_dict=None,
+) -> NLE:
     """Create the NLE model from the config."""
     print("[Model] Creating NLE model...")
     context_embedding = config.model.get('context_embedding', None)
@@ -103,6 +171,8 @@ def create_model(config: ml_collections.ConfigDict, pre_transforms, norm_dict) -
         scheduler_args=config.scheduler.to_dict(),
         pre_transforms=pre_transforms,
         val_nll_batches=config.model.get('val_nll_batches', 8),
+        track_dict=track_dict,
+        x_labels=config.x_labels,
     )
 
 
@@ -124,6 +194,7 @@ def main(config: ml_collections.ConfigDict, config_path: str = None):
 
     checkpoint_path = None
     norm_dict = None
+    resume_track_dict = None
     if resume_training:
         checkpoint_path = training.get_checkpoint_path(config, project_dir)
         print(f"[Checkpoint] Resuming from: {checkpoint_path}")
@@ -135,15 +206,32 @@ def main(config: ml_collections.ConfigDict, config_path: str = None):
         norm_dict = resume_checkpoint['hyper_parameters']['norm_dict']
         print("[Checkpoint] Reusing norm_dict from resumed checkpoint")
 
+        # And its track: the weights were fitted against that one, so a
+        # config now pointing elsewhere would silently change what every
+        # input means.
+        resume_track_dict = resume_checkpoint['hyper_parameters'].get(
+            'track_dict')
+
+    print("[Track] Loading stream track...")
+    track_dict, track = load_track(config, project_dir)
+    if resume_training and resume_track_dict != track_dict:
+        sha = lambda d: (d or {}).get('meta', {}).get('stream_sha256')
+        raise ValueError(
+            'the resumed checkpoint was trained with a different track '
+            f'(stream_sha256 {sha(resume_track_dict)} vs '
+            f'{sha(track_dict)}). Point config.track_path at the one it '
+            'was trained with, or start a fresh run.')
+
     print("[Data] Loading datasets...")
-    train_loader, val_loader, norm_dict = prepare_data(config, norm_dict=norm_dict)
+    train_loader, val_loader, norm_dict = prepare_data(
+        config, norm_dict=norm_dict, track=track, track_dict=track_dict)
     print(f"[Data] Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     print("[Transforms] Building pre-transforms...")
     pre_transforms = build_transformation(**config.pre_transforms.to_dict())
 
     print("[Model] Creating NLE model...")
-    model = create_model(config, pre_transforms, norm_dict)
+    model = create_model(config, pre_transforms, norm_dict, track_dict)
     summarize(model, max_depth=3)
     training.report_param_counts(model)
 
