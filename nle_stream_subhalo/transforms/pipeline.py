@@ -4,6 +4,7 @@ from tqdm import tqdm
 import torch
 
 from .basic import StarBatch
+from .stages import fit_x_stages
 from .uncertainty import UncertaintySampler
 
 
@@ -54,7 +55,10 @@ def build_transformation(
 
 
 def compute_field_norm(
-    batch: StarBatch, batch_size: int = 4096, **pre_transform_kwargs
+    batch: StarBatch, batch_size: int = 4096, track=None,
+    x_stages=None, track_dict=None, x_labels=None, n_knots: int = 256,
+    max_stars: int = None, seed: int = 0,
+    **pre_transform_kwargs
 ) -> dict:
     """Measure per-field normalization stats for the NLE model.
 
@@ -67,6 +71,30 @@ def compute_field_norm(
     Args:
         batch: Raw StarBatch with `x` (and `theta`) set.
         batch_size: Number of stars per streaming chunk.
+        max_stars: Measure the `x`/`xerr` stats on at most this many stars,
+            drawn uniformly at random. These stats are approximate however
+            many stars go in -- the pipeline resamples the measurement
+            noise on every call, so no finite sample pins them down -- and
+            the cost is not: the full training `x` is copied through the
+            pipeline, concatenated, and copied again per fitted stage, so
+            223M stars run to ~30 GB of transient allocation for numbers a
+            few million already resolve. `theta` and `cond` stats are
+            always exact; they are min/max over an existing tensor and
+            allocate nothing.
+        seed: Draws the subsample, so a rerun measures the same stats.
+        track: Optional `transforms.StreamTrack`. When given, the `x`
+            stats are measured on track offsets rather than on raw
+            coordinates -- they have to describe what the model actually
+            normalizes, and the model projects before it scales.
+            Ignored when `x_stages` is given, since the track is then one
+            of the stages.
+        x_stages: Optional sequence of stage `kind` strings, e.g.
+            `('track_shear', 'marginal_uniform')`. When given, the `x`
+            side of the returned dict is an `x_stages` chain fitted by
+            `stages.fit_x_stages` instead of `x_loc`/`x_scale`.
+        track_dict: Required if `'track_shear'` is among `x_stages`.
+        x_labels: Column order of `x`, required with `'track_shear'`.
+        n_knots: Quantile knots for a `marginal_uniform` stage.
         **pre_transform_kwargs: Same kwargs as `build_transformation`.
 
     Returns:
@@ -77,13 +105,32 @@ def compute_field_norm(
     """
     pipeline = build_transformation(**pre_transform_kwargs)
 
-    n = batch.x.shape[0]
+    source = batch.x
+    n = source.shape[0]
+    if max_stars is not None and n > max_stars:
+        # Reason: with replacement, so this stays O(max_stars) -- a
+        # randperm over 223M rows would itself allocate 1.8 GB. At these
+        # ratios repeats are ~1 in 10^5 and move no statistic.
+        generator = torch.Generator().manual_seed(seed)
+        rows = torch.randint(n, (max_stars,), generator=generator)
+        source = source[rows.sort().values]   # sorted: one ordered gather
+        n = max_stars
+        print(f'Field normalization on {n:,} of {batch.x.shape[0]:,} stars')
+
     x_parts, xerr_parts = [], []
     for start in tqdm(range(0, n, batch_size), desc='Computing field normalization'):
         stop = start + batch_size
-        chunk = StarBatch(x=batch.x[start:stop])
+        chunk = StarBatch(x=source[start:stop])
         out = pipeline(chunk)
-        x_parts.append(out.x)
+        # With stages the chain is fitted on the observed coordinates and
+        # applies the track itself, so nothing is projected here. Without
+        # them, projection and the measurement model commute (phi1 is
+        # noiseless), but this mirrors the model's own order anyway rather
+        # than relying on that.
+        if x_stages is not None or track is None:
+            x_parts.append(out.x)
+        else:
+            x_parts.append(track.project(out.x))
         if out.xerr is not None:
             xerr_parts.append(out.xerr)
 
@@ -91,11 +138,16 @@ def compute_field_norm(
 
     _floor = lambda scale: scale.clamp_min(1e-6)  # avoid divide-by-zero
 
-    x_min, x_max = x_all.min(dim=0)[0], x_all.max(dim=0)[0]
-    norm = {
-        'x_loc': ((x_max + x_min) / 2).tolist(),
-        'x_scale': _floor((x_max - x_min) / 2).tolist(),
-    }
+    if x_stages is not None:
+        norm = {'x_stages': fit_x_stages(
+            x_stages, x_all, track_dict=track_dict, x_labels=x_labels,
+            n_knots=n_knots)}
+    else:
+        x_min, x_max = x_all.min(dim=0)[0], x_all.max(dim=0)[0]
+        norm = {
+            'x_loc': ((x_max + x_min) / 2).tolist(),
+            'x_scale': _floor((x_max - x_min) / 2).tolist(),
+        }
 
     if xerr_parts:
         err_all = torch.cat(xerr_parts, dim=0)
@@ -104,7 +156,11 @@ def compute_field_norm(
         norm['xerr_scale'] = _floor((err_max - err_min) / 2).tolist()
 
     # theta and cond both normalized to ~[-1, 1] via midrange/half-range.
-    for name in ('x', 'xerr', 'theta', 'cond'):
+    # x and xerr are deliberately not in this loop: their stats come from
+    # the streamed chunks above, which carry the measurement noise and the
+    # track projection. Reading them off `batch` here would take the raw,
+    # unobserved, unprojected values instead.
+    for name in ('theta', 'cond'):
         field = getattr(batch, name)
         if field is None:
             continue
