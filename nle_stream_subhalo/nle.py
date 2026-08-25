@@ -8,6 +8,7 @@ on (per-star density + sampling) -- assumptions like i.i.d. stars, priors,
 fixing/sampling `cond`, and MCMC live outside the model.
 
 """
+from typing import Optional
 
 import pytorch_lightning as pl
 import torch
@@ -15,7 +16,7 @@ import torch.nn as nn
 import zuko
 
 from .flow_matching import FlowMatching
-from .transforms import StarBatch
+from .transforms import StagePipeline, StarBatch, StreamTrack
 from .utils import MLP, configure_optimizers, get_activation
 
 
@@ -78,6 +79,16 @@ class NLE(pl.LightningModule):
         also measured. `val/loss` is then the velocity-regression loss,
         which is not comparable across architectures, so `val/nll` is
         logged alongside it for that. Each such batch costs an ODE solve.
+    track_dict : dict, optional
+        From `transforms.load_track_dict`. When given, `x` is
+        re-expressed as offsets from the unperturbed stream track before
+        being normalized, and `sample` maps its draws back. Lives on the
+        model rather than in `pre_transforms` so training and inference
+        cannot disagree about it, and so a checkpoint can never be paired
+        with the wrong track.
+    x_labels : sequence of str, optional
+        Column order of `x`. Required with `track_dict`, which stores its
+        coordinates by name.
     """
 
     def __init__(
@@ -89,6 +100,8 @@ class NLE(pl.LightningModule):
         scheduler_args: dict = None,
         pre_transforms=None,
         val_nll_batches: int = 8,
+        track_dict: dict = None,
+        x_labels=None,
     ):
         super().__init__()
         self.norm_dict = norm_dict
@@ -99,18 +112,61 @@ class NLE(pl.LightningModule):
         self.pre_transforms = pre_transforms
         self.val_nll_batches = val_nll_batches
 
+        self.x_labels = list(x_labels) if x_labels is not None else None
+
         self.save_hyperparameters(ignore=['pre_transforms'])
 
+        # Order matters: the stage chain is built here, and the track may
+        # be one of its stages.
         self._register_norm(norm_dict)
+        self._register_track(track_dict, x_labels)
         self._setup_model()
 
     # -- setup --------------------------------------------------------------
 
+    def _register_track(self, track_dict: dict, x_labels):
+        """Attach the stream track, if this run uses one.
+
+        Legacy path: runs whose `norm_dict` carries `x_stages` get the
+        track as a stage in that chain instead, and `self.track` points at
+        it so callers keep working either way.
+        """
+        if self.x_stages is not None:
+            self.track = next(
+                (stage for stage in self.x_stages.stages
+                 if isinstance(stage, StreamTrack)), None)
+            return
+        if track_dict is None:
+            self.track = None
+            return
+        if x_labels is None:
+            raise ValueError(
+                'track_dict needs x_labels: the track stores its '
+                'coordinates by name, and the simulator\'s column order '
+                'is not the one the configs use')
+
+        self.track = StreamTrack(track_dict, x_labels)
+        print(f"[NLE] Track over {len(self.track.coords)} coordinates "
+              f"({', '.join(self.track.coords)}), "
+              f"{self.track.knots.numel()} knots")
+
     def _register_norm(self, norm_dict: dict):
+        """Register the context scalings, and the `x` stage chain.
+
+        `x` goes through `transforms.stages`; `theta`, `xerr` and `cond`
+        are always a plain affine scaling, since they are context rather
+        than something the flow models.
+
+        A `norm_dict` without `x_stages` is from before stages existed and
+        keeps the old single affine `x` scaling, so old checkpoints load
+        unchanged.
+        """
         self.has_cond = 'cond_loc' in norm_dict
-        fields = ['x', 'xerr', 'theta']
-        if self.has_cond:
-            fields.append('cond')
+        self.x_stages = None
+
+        fields = ['xerr', 'theta'] + (['cond'] if self.has_cond else [])
+        if 'x_stages' not in norm_dict:
+            fields.append('x')
         for field in fields:
             self.register_buffer(
                 f'{field}_loc',
@@ -119,10 +175,19 @@ class NLE(pl.LightningModule):
                 f'{field}_scale',
                 torch.tensor(norm_dict[f'{field}_scale'], dtype=torch.float32))
 
+        if 'x_stages' in norm_dict:
+            self.x_stages = StagePipeline(
+                norm_dict['x_stages'], self.x_labels)
+            print(f'[NLE] x stages: {self.x_stages.describe()}')
+
     def _setup_model(self):
         """Set up the field layout, optional context MLP, and flow."""
         dims = {f: len(self.norm_dict[f'{f}_loc'])
-                for f in ('x', 'xerr', 'theta')}
+                for f in ('xerr', 'theta')}
+        # With stages there is no `x_loc` to read the width off; the chain
+        # preserves the column count, so `x_labels` gives it.
+        dims['x'] = (len(self.x_labels) if self.x_stages is not None
+                     else len(self.norm_dict['x_loc']))
         if self.has_cond:
             dims['cond'] = len(self.norm_dict['cond_loc'])
 
@@ -157,19 +222,44 @@ class NLE(pl.LightningModule):
     # -- normalization / assembly ------------------------------------------
 
     def _normalize(self, batch: StarBatch) -> StarBatch:
-        """Normalize every present field to the training scale."""
+        """Push `x` through the stage chain and scale the context fields.
+
+        Everything lives here so every caller gets it -- training through
+        `_prepare_batch`, inference through `log_prob` and `sample` -- with
+        no way for the two paths to drift apart.
+        """
         def norm(field, value):
             if value is None:
                 return None
             return (value - getattr(self, f'{field}_loc')) / getattr(
                 self, f'{field}_scale')
 
+        x = batch.x
+        if x is not None:
+            if self.x_stages is not None:
+                x = self.x_stages(x)
+            else:
+                if self.track is not None:
+                    x = self.track.project(x)
+                x = norm('x', x)
+
         return StarBatch(
-            x=norm('x', batch.x),
+            x=x,
             xerr=norm('xerr', batch.xerr),
             theta=norm('theta', batch.theta),
             cond=norm('cond', batch.cond) if self.has_cond else None,
         )
+
+    def _denormalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        """Inverse of the `x` half of `_normalize`, for flow samples."""
+        if self.x_stages is not None:
+            return self.x_stages.inverse(x)
+
+        loc = torch.cat([getattr(self, f'{f}_loc') for f in self.target_fields])
+        scale = torch.cat(
+            [getattr(self, f'{f}_scale') for f in self.target_fields])
+        x = x * scale + loc
+        return x if self.track is None else self.track.unproject(x)
 
     def _assemble(self, batch: StarBatch, fields) -> torch.Tensor:
         cols = []
@@ -187,11 +277,11 @@ class NLE(pl.LightningModule):
             self._assemble(norm_batch, self.context_fields))
         return target, context
 
-    def _flow_log_prob(self, norm_batch: StarBatch) -> torch.Tensor:
+    def _flow_log_prob(self, norm_batch: StarBatch, steps: Optional[int] = None) -> torch.Tensor:
         """Per-star log p(target | context) for a normalized StarBatch."""
         target, context = self._target_context(norm_batch)
         if self.is_continuous:
-            return self.flow.log_prob(target, context)
+            return self.flow.log_prob(target, context, steps=steps)
         return self.flow(context).log_prob(target)
 
     # -- training -----------------------------------------------------------
@@ -202,10 +292,10 @@ class NLE(pl.LightningModule):
             batch = self.pre_transforms(batch)
         return self._normalize(batch)
 
-    def _loss(self, norm_batch: StarBatch) -> torch.Tensor:
+    def _loss(self, norm_batch: StarBatch, steps: Optional[int] = None) -> torch.Tensor:
         """Training objective: velocity regression, or the NLL."""
         if self.is_continuous:
-            return self.flow.loss(*self._target_context(norm_batch))
+            return self.flow.loss(*self._target_context(norm_batch), steps=steps)
         return -self._flow_log_prob(norm_batch).mean()
 
     def training_step(self, batch, batch_idx):
@@ -248,7 +338,7 @@ class NLE(pl.LightningModule):
     # -- inference (observed data in physical units) -----------------------
 
     @torch.no_grad()
-    def log_prob(self, batch: StarBatch) -> torch.Tensor:
+    def log_prob(self, batch: StarBatch, steps: Optional[int] = None) -> torch.Tensor:
         """Per-star log p(observables | theta, cond) for a physical batch.
 
         `batch` holds the observed per-star fields (`x`, `xerr`) plus the
@@ -257,26 +347,29 @@ class NLE(pl.LightningModule):
         tensor; summing over stars, priors, and MCMC are the caller's job.
         """
         self.eval()
-        return self._flow_log_prob(self._normalize(batch.to(self.device)))
+        return self._flow_log_prob(self._normalize(batch.to(self.device)), steps=steps)
 
     @torch.no_grad()
-    def sample(self, batch: StarBatch, num_samples: int = 1) -> torch.Tensor:
+    def sample(self, batch: StarBatch, num_samples: int = 1, steps: Optional[int] = None) -> torch.Tensor:
         """Sample observables from p(target | context) for each star.
 
         Uses the context assembled from `batch` (theta, cond, and the
         conditioning observables). Returns physical-unit samples of shape
-        (n_stars, num_samples, target_dim).
+        (n_stars, num_samples, target_dim), with the track added back
+        when the run uses one.
         """
         self.eval()
         norm_batch = self._normalize(batch.to(self.device))
         context = self.context_embedding(
             self._assemble(norm_batch, self.context_fields))
         if self.is_continuous:
-            samples = self.flow.sample(context, num_samples)
+            samples = self.flow.sample(context, num_samples, steps=steps)
         else:
             samples = self.flow(context).sample((num_samples,)).transpose(0, 1)
 
-        loc = torch.cat([getattr(self, f'{f}_loc') for f in self.target_fields])
-        scale = torch.cat(
-            [getattr(self, f'{f}_scale') for f in self.target_fields])
-        return samples * scale + loc
+        # Inverted against the *sampled* phi1, not the one conditioned on:
+        # phi1 is one of the modelled coordinates, so the drawn value is
+        # the one these offsets belong to.
+        shape = samples.shape
+        return self._denormalize_x(
+            samples.reshape(-1, shape[-1])).reshape(shape)
