@@ -37,17 +37,21 @@ EXTRA_ARGS=("$@")
 # Not self-located via $BASH_SOURCE: SLURM runs a copy of this script from
 # a spool dir, so that would resolve to the wrong directory. submit.sh
 # exports NLE_DIR correctly; this fallback is only for direct `sbatch` use.
-NLE_DIR="${NLE_DIR:-/home/tvnguyen/projects/sbi_stream/nle_stream}"
+NLE_DIR="${NLE_DIR:-/home/tvnguyen/projects/sbi_stream/nle_stream_subhalo}"
 RUN_DIR="${RUN_DIR:-/scratch/tvnguyen/slurm_logs/nle/manual/${SLURM_JOB_NAME}_${SLURM_JOB_ID}}"
 MANIFEST="$RUN_DIR/manifest.txt"
 mkdir -p "$RUN_DIR"
 
 # Resolve config relative to nle_stream/ if it isn't already absolute/relative-found.
-if [[ ! -f "$CONFIG" ]]; then
-    if [[ -f "$NLE_DIR/$CONFIG" ]]; then
-        CONFIG="$NLE_DIR/$CONFIG"
-    fi
+# A trailing ":variant" is ml_collections' argument to get_config(), not part
+# of the path, so it is split off for every filesystem test and reattached.
+CONFIG_PATH="${CONFIG%%:*}"
+CONFIG_VARIANT=""
+[[ "$CONFIG" == *:* ]] && CONFIG_VARIANT=":${CONFIG#*:}"
+if [[ ! -f "$CONFIG_PATH" && -f "$NLE_DIR/$CONFIG_PATH" ]]; then
+    CONFIG_PATH="$NLE_DIR/$CONFIG_PATH"
 fi
+CONFIG="${CONFIG_PATH}${CONFIG_VARIANT}"
 
 # Redirect caches that default to $HOME (read-only on compute nodes).
 export XDG_CACHE_HOME="/scratch/tvnguyen/cache"
@@ -70,7 +74,7 @@ log "config:       $CONFIG"
 log "extra_args:   ${EXTRA_ARGS[*]:-<none>}"
 log "sims commit:  $(git -C "$NLE_DIR/../sbi_stream_pipeline" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-cp -- "$CONFIG" "$RUN_DIR/config_snapshot.py" 2>/dev/null || true
+cp -- "$CONFIG_PATH" "$RUN_DIR/config_snapshot.py" 2>/dev/null || true
 
 # The stream project's venv (torch-jax), not `torch` — see
 # sbi_stream_pipeline/README.md. Activated directly rather than via

@@ -62,8 +62,13 @@ for NOTEBOOK in "${NOTEBOOKS[@]}"; do
     EXECUTED="$OUT_DIR/$(basename "$NOTEBOOK")"
 
     log "executing: $EXECUTED"
+    # Pin the kernel: a notebook saved from a kernel that is not
+    # registered here (e.g. one named "torch") otherwise dies with
+    # NoSuchKernel before executing a single cell.
     jupyter nbconvert --to notebook --execute --inplace \
-        --ExecutePreprocessor.timeout=7200 "$EXECUTED"
+        --ExecutePreprocessor.timeout=7200 \
+        --ExecutePreprocessor.kernel_name="${KERNEL_NAME:-python3}" \
+        "$EXECUTED"
     RC=$?
     log "nbconvert exit: $RC  ($EXECUTED)"
     [[ $RC -ne 0 ]] && STATUS=$RC
