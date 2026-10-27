@@ -17,7 +17,8 @@ import zuko
 
 from .flow_matching import FlowMatching
 from .transforms import StagePipeline, StarBatch, StreamTrack
-from .utils import MLP, configure_optimizers, get_activation
+from .utils import (MLP, configure_optimizers, get_activation,
+                    resolve_schedule)
 
 
 def build_flow(
@@ -86,7 +87,22 @@ class NLE(pl.LightningModule):
         model rather than in `pre_transforms` so training and inference
         cannot disagree about it, and so a checkpoint can never be paired
         with the wrong track.
+    x_context_labels : sequence of str, optional
+        Observable columns to condition on rather than model, so the
+        flow learns p(x | x_context, theta, theta_context, xerr).
+        Disjoint from `x_labels`: a column is modelled or conditioned
+        on, never both.  `batch.x` holds them concatenated in that
+        order, modelled first.  Columns
+        shaped by the selection function belong here: a stream's
+        footprint and membership cuts act almost entirely on phi1 and
+        phi2, and conditioning on a coordinate removes its selection
+        function from the likelihood without having to model it.  The
+        cost is the marginal it discards -- conditioning on phi1 gives
+        up the linear density along the stream.  Empty by default,
+        which models every column.
     x_labels : sequence of str, optional
+        Observable columns the flow models.  Disjoint from
+        `x_context_labels`.
         Column order of `x`. Required with `track_dict`, which stores its
         coordinates by name.
     """
@@ -102,6 +118,7 @@ class NLE(pl.LightningModule):
         val_nll_batches: int = 8,
         track_dict: dict = None,
         x_labels=None,
+        x_context_labels=None,
     ):
         super().__init__()
         self.norm_dict = norm_dict
@@ -113,13 +130,26 @@ class NLE(pl.LightningModule):
         self.val_nll_batches = val_nll_batches
 
         self.x_labels = list(x_labels) if x_labels is not None else None
+        self.x_context_labels = (
+            list(x_context_labels) if x_context_labels else [])
+        # `batch.x` carries the modelled columns first, then the
+        # conditioned ones, so the split is a prefix/suffix rather than
+        # a lookup.  The track and the stage chain are defined over all
+        # of them, which is what `x_all_labels` is for.
+        self.x_all_labels = (
+            (self.x_labels or []) + self.x_context_labels) or None
+        if self.x_labels and set(self.x_labels) & set(self.x_context_labels):
+            raise ValueError(
+                'x_labels and x_context_labels must be disjoint; '
+                f'both contain '
+                f'{sorted(set(self.x_labels) & set(self.x_context_labels))}')
 
         self.save_hyperparameters(ignore=['pre_transforms'])
 
         # Order matters: the stage chain is built here, and the track may
         # be one of its stages.
         self._register_norm(norm_dict)
-        self._register_track(track_dict, x_labels)
+        self._register_track(track_dict, self.x_all_labels)
         self._setup_model()
 
     # -- setup --------------------------------------------------------------
@@ -177,7 +207,7 @@ class NLE(pl.LightningModule):
 
         if 'x_stages' in norm_dict:
             self.x_stages = StagePipeline(
-                norm_dict['x_stages'], self.x_labels)
+                norm_dict['x_stages'], self.x_all_labels)
             print(f'[NLE] x stages: {self.x_stages.describe()}')
 
     def _setup_model(self):
@@ -186,17 +216,41 @@ class NLE(pl.LightningModule):
                 for f in ('xerr', 'theta')}
         # With stages there is no `x_loc` to read the width off; the chain
         # preserves the column count, so `x_labels` gives it.
-        dims['x'] = (len(self.x_labels) if self.x_stages is not None
+        dims['x'] = (len(self.x_all_labels) if self.x_stages is not None
                      else len(self.norm_dict['x_loc']))
         if self.has_cond:
             dims['cond'] = len(self.norm_dict['cond_loc'])
 
-        context = ['theta'] + (['cond'] if self.has_cond else []) + ['xerr']
+        # Fixed order: theta, theta_context, x_context, xerr.  Anything
+        # assembling a context by hand -- `inference.build_context` for
+        # observed data above all -- has to lay it out the same way, so
+        # it is written once here and read from `context_order`.
         self.target_fields = ['x', ]
-        self.context_fields = context
+        self.context_fields = (
+            ['theta'] + (['cond'] if self.has_cond else []) + ['xerr'])
+        self.context_order = (
+            ['theta'] + (['cond'] if self.has_cond else [])
+            + (['x_context'] if self.x_context_labels else []) + ['xerr'])
 
-        target_size = sum(dims[f] for f in self.target_fields)
-        context_size = sum(dims[f] for f in self.context_fields)
+        if self.x_context_labels and not self.x_labels:
+            raise ValueError(
+                'x_context_labels needs x_labels: the flow has to have '
+                'something left to model')
+
+        n_model = len(self.x_labels or [])
+        n_x_context = len(self.x_context_labels)
+        # Modelled columns come first in `x`, conditioned ones after.
+        self.register_buffer('x_target_idx',
+                             torch.arange(n_model, dtype=torch.long),
+                             persistent=False)
+        self.register_buffer('x_context_idx',
+                             torch.arange(n_model, n_model + n_x_context,
+                                          dtype=torch.long),
+                             persistent=False)
+
+        target_size = sum(dims[f] for f in self.target_fields) - n_x_context
+        context_size = (sum(dims[f] for f in self.context_fields)
+                        + n_x_context)
 
         if self.context_embedding_args:
             args = dict(self.context_embedding_args)
@@ -215,7 +269,7 @@ class NLE(pl.LightningModule):
         self.flow = build_flow(target_size, flow_context_size, **self.flows_args)
         self.is_continuous = isinstance(self.flow, FlowMatching)
         print(f"[NLE] Modeling p({','.join(self.target_fields)} | "
-              f"{','.join(self.context_fields)})")
+              f"{','.join(self.context_order)})")
         print(f"[NLE] Flow built with"
               f" {sum(p.numel() for p in self.flow.parameters()):,} parameters")
 
@@ -271,11 +325,31 @@ class NLE(pl.LightningModule):
         return torch.cat(cols, dim=1)
 
     def _target_context(self, norm_batch: StarBatch):
-        """Split a normalized batch into (target, embedded context)."""
-        target = self._assemble(norm_batch, self.target_fields)
-        context = self.context_embedding(
-            self._assemble(norm_batch, self.context_fields))
-        return target, context
+        """Split a normalized batch into (target, embedded context).
+
+        The observable columns named in `x_context_labels` cross from
+        the target into the context here, which is the only place the
+        split is applied.
+        """
+        x = self._assemble(norm_batch, self.target_fields)
+        target = (x[:, self.x_target_idx] if self.x_context_idx.numel()
+                  else x)
+        return target, self._context(norm_batch)
+
+    def _context(self, norm_batch: StarBatch) -> torch.Tensor:
+        """Assemble and embed the context, observables included.
+
+        The one place the context is built, so `sample` and
+        `_target_context` cannot disagree about whether the columns in
+        `x_context_labels` are part of it.
+        """
+        head = ['theta'] + (['cond'] if self.has_cond else [])
+        cols = [self._assemble(norm_batch, head)]
+        if self.x_context_idx.numel():
+            x = self._assemble(norm_batch, self.target_fields)
+            cols.append(x[:, self.x_context_idx])
+        cols.append(self._assemble(norm_batch, ['xerr']))
+        return self.context_embedding(torch.cat(cols, dim=1))
 
     def _flow_log_prob(self, norm_batch: StarBatch, steps: Optional[int] = None) -> torch.Tensor:
         """Per-star log p(target | context) for a normalized StarBatch."""
@@ -328,9 +402,30 @@ class NLE(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        """Initialize optimizer and LR scheduler."""
+        """Initialize optimizer and LR scheduler.
+
+        An epoch-denominated schedule is resolved to steps here,
+        because this is the first point where the trainer knows how
+        long an epoch is.  `estimated_stepping_batches` is Lightning's
+        own count for the whole run, so it already accounts for
+        accumulate_grad_batches, drop_last and device sharding, none
+        of which len(dataloader) would.
+        """
+        steps_per_epoch = 0
+        trainer = getattr(self, '_trainer', None)
+        if trainer is not None and trainer.max_epochs:
+            steps_per_epoch = max(
+                1, trainer.estimated_stepping_batches // trainer.max_epochs)
+
+        scheduler_args = resolve_schedule(
+            self.scheduler_args, steps_per_epoch)
+        if scheduler_args is not self.scheduler_args and \
+                scheduler_args != self.scheduler_args:
+            print(f'[LR] {steps_per_epoch} steps/epoch -> '
+                  f'decay {scheduler_args.get("decay_steps")}, '
+                  f'warmup {scheduler_args.get("warmup_steps")}')
         return configure_optimizers(
-            self.parameters(), self.optimizer_args, self.scheduler_args)
+            self.parameters(), self.optimizer_args, scheduler_args)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         return batch.to(device)
@@ -360,16 +455,27 @@ class NLE(pl.LightningModule):
         """
         self.eval()
         norm_batch = self._normalize(batch.to(self.device))
-        context = self.context_embedding(
-            self._assemble(norm_batch, self.context_fields))
+        context = self._context(norm_batch)
         if self.is_continuous:
             samples = self.flow.sample(context, num_samples, steps=steps)
         else:
             samples = self.flow(context).sample((num_samples,)).transpose(0, 1)
 
-        # Inverted against the *sampled* phi1, not the one conditioned on:
-        # phi1 is one of the modelled coordinates, so the drawn value is
-        # the one these offsets belong to.
+        # The stage chain -- the track shear above all -- is defined on
+        # the full set of columns, so the conditioned ones have to be
+        # put back before inverting.  That also fixes which phi1 the
+        # track is undone against: the sampled one when phi1 is
+        # modelled, the conditioned one when it is not.
         shape = samples.shape
-        return self._denormalize_x(
-            samples.reshape(-1, shape[-1])).reshape(shape)
+        flat = samples.reshape(-1, shape[-1])
+        if self.x_context_idx.numel():
+            full = torch.empty(flat.shape[0], len(self.x_all_labels),
+                               dtype=flat.dtype, device=flat.device)
+            full[:, self.x_target_idx] = flat
+            held = norm_batch.x[:, self.x_context_idx]
+            full[:, self.x_context_idx] = held.repeat_interleave(
+                num_samples, dim=0)
+            flat = self._denormalize_x(full)[:, self.x_target_idx]
+        else:
+            flat = self._denormalize_x(flat)
+        return flat.reshape(shape)
