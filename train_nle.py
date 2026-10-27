@@ -29,7 +29,7 @@ import torch
 from absl import flags
 from ml_collections import config_flags
 
-from nle_stream_subhalo import datasets, training
+from nle_stream_subhalo import datasets, labels, training
 from nle_stream_subhalo.nle import NLE
 from nle_stream_subhalo.transforms import (
     StreamTrack, build_transformation, load_track_dict)
@@ -124,7 +124,9 @@ def prepare_data(
 
     Each star is one row of `x_all_labels(config)` -- the modelled
     observables followed by the conditioned ones -- and the per-stream
-    `config.theta_labels` are broadcast to its member stars.
+    `config.theta_labels` are broadcast to its member stars.  Those
+    labels may be derived rather than stored; see
+    `nle_stream_subhalo.labels`.
 
     Returns (train_loader, val_loader, norm_dict). When `norm_dict` is given
     (e.g. reused from a resumed checkpoint) it is passed through unchanged
@@ -144,6 +146,15 @@ def prepare_data(
         init=config.get('init', 0),
         is_directory=True,
         concat=True,
+    )
+    # A dataset stores what its prior drew; `theta_labels` may name a
+    # better-conditioned form of it -- components instead of polar
+    # pairs, so an impact azimuth does not wrap. gd1_nle defines
+    # those and is only needed when one is asked for.
+    graph_feats = labels.expand(
+        graph_feats,
+        wanted=tuple(config.theta_labels)
+        + tuple(config.get('theta_context_labels', None) or ()),
     )
 
     train_loader, val_loader, norm_dict = datasets.prepare_dataloaders(
