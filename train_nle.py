@@ -56,6 +56,34 @@ def save_config_snapshot(
         shutil.copy2(config_path, snapshot_dir / 'config_snapshot.py')
 
 
+def x_all_labels(config) -> tuple:
+    """Per-star columns to load, modelled first then conditioned.
+
+    `config.x_labels` names what the flow models and
+    `config.x_context_labels` what it conditions on; the two are
+    disjoint, and their concatenation in this order is the column
+    layout of `batch.x` that the model, the track and the stage chain
+    all assume.
+
+    Args:
+        config: The run config.
+
+    Returns:
+        Tuple of column names.
+
+    Raises:
+        ValueError: If the two overlap.
+    """
+    x = tuple(config.x_labels)
+    ctx = tuple(config.get('x_context_labels', None) or ())
+    both = set(x) & set(ctx)
+    if both:
+        raise ValueError(
+            f'x_labels and x_context_labels must be disjoint; both '
+            f'contain {sorted(both)}')
+    return x + ctx
+
+
 def load_track(config: ml_collections.ConfigDict, snapshot_dir: Path = None):
     """Load the unperturbed stream track, if this run uses one.
 
@@ -75,7 +103,7 @@ def load_track(config: ml_collections.ConfigDict, snapshot_dir: Path = None):
         return None, None
 
     track_dict = load_track_dict(path)
-    track = StreamTrack(track_dict, config.x_labels)
+    track = StreamTrack(track_dict, x_all_labels(config))
     print(f'[Track] Loaded {path}')
     print(f'[Track] {len(track.coords)} coordinates '
           f"({', '.join(track.coords)}), {track.knots.numel()} knots, "
@@ -94,8 +122,9 @@ def prepare_data(
     track_dict=None):
     """Load data and build per-star train/val dataloaders.
 
-    Each star is one row of `config.x_labels` (stream-frame observables);
-    the per-stream `config.labels` are broadcast to its member stars.
+    Each star is one row of `x_all_labels(config)` -- the modelled
+    observables followed by the conditioned ones -- and the per-stream
+    `config.theta_labels` are broadcast to its member stars.
 
     Returns (train_loader, val_loader, norm_dict). When `norm_dict` is given
     (e.g. reused from a resumed checkpoint) it is passed through unchanged
@@ -120,9 +149,9 @@ def prepare_data(
     train_loader, val_loader, norm_dict = datasets.prepare_dataloaders(
         node_feats,
         graph_feats,
-        config.x_labels,
-        config.labels,
-        cond_labels=config.get('cond_labels', None),
+        x_all_labels(config),
+        config.theta_labels,
+        cond_labels=config.get('theta_context_labels', None),
         train_batch_size=config.train_batch_size,
         eval_batch_size=config.eval_batch_size,
         train_frac=config.train_frac,
@@ -149,7 +178,7 @@ def _norm_kwargs(config: ml_collections.ConfigDict, track_dict=None) -> dict:
     stages = list(stages)
     print(f"[Stages] Fitting x chain: {' -> '.join(stages)}")
     return dict(x_stages=stages, track_dict=track_dict,
-                x_labels=list(config.x_labels),
+                x_labels=list(x_all_labels(config)),
                 n_knots=config.model.get('n_knots', 256))
 
 
@@ -173,6 +202,7 @@ def create_model(
         val_nll_batches=config.model.get('val_nll_batches', 8),
         track_dict=track_dict,
         x_labels=config.x_labels,
+        x_context_labels=config.get('x_context_labels', None),
     )
 
 
