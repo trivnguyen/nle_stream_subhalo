@@ -153,6 +153,75 @@ class WarmUpCosineAnnealingLR(torch.optim.lr_scheduler.LambdaLR):
         return self.eta_min + 0.5 * (1 + math.cos(math.pi * progress))
 
 
+# Epoch-denominated schedule keys and the step keys they resolve to.
+EPOCH_KEYS = {'decay_epochs': 'decay_steps',
+              'warmup_epochs': 'warmup_steps',
+              'T_max_epochs': 'T_max'}
+
+
+def resolve_schedule(scheduler_args, steps_per_epoch):
+    """Express an epoch-denominated LR schedule in steps.
+
+    A schedule is easier to write in epochs -- `decay_epochs` is just
+    the length of the run -- but worse to *run* in epochs: stepping a
+    cosine once per epoch makes it a staircase with one rung per
+    epoch, and the warmup, the one part where resolution matters,
+    collapses to a single rung.  So the epoch keys are multiplied out
+    here and the scheduler still runs per batch.
+
+    The multiplication uses the measured steps per epoch, so it cannot
+    go stale when the dataset changes size -- which is the failure a
+    hand-computed step count invites.
+
+    Strictly additive: a config with no `*_epochs` key is returned
+    unchanged, `interval` included, so existing step-denominated runs
+    behave exactly as before.
+
+    Parameters
+    ----------
+    scheduler_args : Mapping or None
+        The config's scheduler block.
+    steps_per_epoch : int
+        Optimiser steps in one epoch.
+
+    Returns
+    -------
+    dict
+        A copy with every `*_epochs` key replaced by its step
+        equivalent, and `interval` set to 'step' when any conversion
+        happened.  The input is not mutated, so a config snapshot
+        still records what was written.
+
+    Raises
+    ------
+    ValueError
+        If a quantity is given in both epochs and steps, or if
+        steps_per_epoch is not positive when a conversion is needed.
+    """
+    args = dict(scheduler_args or {})
+    present = [k for k in EPOCH_KEYS if args.get(k) is not None]
+    if not present:
+        return args
+
+    clash = [k for k in present if args.get(EPOCH_KEYS[k]) is not None]
+    if clash:
+        pairs = ', '.join(f'{k} and {EPOCH_KEYS[k]}' for k in clash)
+        raise ValueError(
+            f'schedule given in both epochs and steps: {pairs}; '
+            'keep one or the other')
+    if steps_per_epoch < 1:
+        raise ValueError(
+            f'steps_per_epoch must be positive to resolve {present}, '
+            f'got {steps_per_epoch}')
+
+    for key in present:
+        args[EPOCH_KEYS[key]] = int(round(args.pop(key) * steps_per_epoch))
+    # `interval` described the units, not the cadence; the scheduler
+    # runs per batch so the cosine stays smooth.
+    args['interval'] = 'step'
+    return args
+
+
 def configure_optimizers(parameters, optimizer_args, scheduler_args=None):
     """Configure optimizer and (optional) LR scheduler for Lightning.
 
